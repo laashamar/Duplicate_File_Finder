@@ -11,6 +11,8 @@ from data_models import FileMetadata
 class SelectionStrategy(Enum):
     """Defines the available, improved strategies for automatic selection."""
     KEEP_BEST_QUALITY = "Keep best quality"
+    # --- NEW: Added the KEEP_LAST_EDITED strategy ---
+    KEEP_LAST_EDITED = "Keep last edited"
     KEEP_ALL_UNIQUE_VERSIONS = "Keep unique versions (original + edited)"
 
     def __str__(self):
@@ -95,6 +97,14 @@ class AutomaticSelector:
         best_file = self._get_best_in_group(metadata_list)
         return [best_file.path] if best_file else []
 
+    # --- NEW: Implemented the KEEP_LAST_EDITED strategy ---
+    def _strategy_keep_last_edited(self, metadata_list):
+        """Strategy to keep only the file with the most recent modification time."""
+        if not metadata_list:
+            return []
+        last_edited = max(metadata_list, key=lambda m: m.mod_time)
+        return [last_edited.path]
+
     def _strategy_keep_unique_versions(self, metadata_list):
         """
         Strategy to keep the best "original" and the best "edited" version.
@@ -114,36 +124,49 @@ class AutomaticSelector:
     def run_automatic_selection(self, groups, strategy, all_file_data):
         """
         Main method that iterates through groups and selects files based on the chosen strategy.
+        Returns two lists: files for removal, and files to sort (if applicable).
         """
-        all_files_for_removal = set()
+        files_for_removal = set()
+        files_to_sort = {'Originals': [], 'Last Edited': []}
 
         strategy_map = {
             SelectionStrategy.KEEP_BEST_QUALITY: self._strategy_keep_best_quality,
+            # --- NEW: Added mapping for the new strategy ---
+            SelectionStrategy.KEEP_LAST_EDITED: self._strategy_keep_last_edited,
             SelectionStrategy.KEEP_ALL_UNIQUE_VERSIONS: self._strategy_keep_unique_versions
         }
 
         strategy_func = strategy_map.get(strategy)
         if not strategy_func:
             logging.error(f"Unknown strategy: {strategy}. Cannot perform automatic selection.")
-            return []
+            return [], {}
 
         for group in groups:
             if len(group) < 2:
                 continue
 
-            # Fetches all relevant metadata for the current group
             metadata_list = [all_file_data.get(path) for path in group if all_file_data.get(path)]
-
             if len(metadata_list) < 2:
                 logging.warning(f"Did not find enough valid metadata for group, skipping: {group}")
                 continue
 
-            # Runs the selected strategy function to get the list of files to keep
             files_in_group_to_keep = strategy_func(metadata_list)
 
-            # Adds all other files in the group to the removal list
+            # --- NEW: Logic to handle sorting for KEEP_ALL_UNIQUE_VERSIONS ---
+            if strategy == SelectionStrategy.KEEP_ALL_UNIQUE_VERSIONS:
+                best_original = self._get_best_in_group(metadata_list)
+                last_edited = max(metadata_list, key=lambda m: m.mod_time)
+                
+                # The best original file goes into the 'Originals' sort list
+                if best_original.path in files_in_group_to_keep:
+                    files_to_sort['Originals'].append(best_original.path)
+                
+                # The last edited file goes into the 'Last Edited' sort list
+                if last_edited.path in files_in_group_to_keep and last_edited.path != best_original.path:
+                    files_to_sort['Last Edited'].append(last_edited.path)
+
             for file_metadata in metadata_list:
                 if file_metadata.path not in files_in_group_to_keep:
-                    all_files_for_removal.add(file_metadata.path)
+                    files_for_removal.add(file_metadata.path)
 
-        return list(all_files_for_removal)
+        return list(files_for_removal), files_to_sort
