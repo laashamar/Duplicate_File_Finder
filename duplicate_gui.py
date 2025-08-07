@@ -15,29 +15,34 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QColor
 from match_engine import MatchEngine
 from config import DUPLICATES_FOLDER_NAME, MIN_SIZE_BYTES, TARGET_BASE_DIR
-from workers import FileMover, DuplicateChecker
+# --- CHANGED: Importing ActionWorker instead of FileMover ---
+from workers import ActionWorker, DuplicateChecker
 import styles
 
 from logger_setup import setup_global_logger
 from performance_logger import PerformanceLogger
+# --- CHANGED: Importing updated SettingsPanel and StatusPanel ---
 from ui_panels import SettingsPanel, StatusPanel
-# --- NEW: Import the ReviewDialog ---
 from review_dialog import ReviewDialog
+from automatic_selector import SelectionStrategy
 
 
 class DuplicateWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Duplicate Detection – Group Based")
+        self.setWindowTitle("Visual Duplicate Finder")
         self.setMinimumSize(900, 700)
 
         # --- Instance variables ---
         self.all_groups = []
+        self.files_for_removal = []
+        self.files_to_sort = {}
         self.current_group_index = -1
         self.folder_path = None
         self.check_thread = None
-        self.move_thread = None
-        self.match_engine = None
+        # --- CHANGED: Renamed thread variable ---
+        self.action_thread = None
+        self.match_engine = MatchEngine()
         self.performance_logger = PerformanceLogger()
         self.active_run_stats = {}
         self.start_time = 0
@@ -68,21 +73,22 @@ class DuplicateWindow(QWidget):
         self.layout.setSpacing(10)
 
         self.settings_panel = SettingsPanel()
-        # --- REMOVED: The old ReviewPanel is no longer part of the main window ---
         self.status_panel = StatusPanel()
 
         self.layout.addWidget(self.settings_panel)
-        # --- REMOVED: No longer adding the ReviewPanel to the layout ---
         self.layout.addWidget(self.status_panel)
+        # --- NEW: Set initial state for the new UI elements ---
+        self.on_strategy_changed()
 
     def connect_signals(self):
         self.settings_panel.btn_folder.clicked.connect(self.select_folder)
         self.settings_panel.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        # --- NEW: Connect signal for strategy changes ---
+        self.settings_panel.strategy_combo.currentIndexChanged.connect(self.on_strategy_changed)
         self.settings_panel.slider_threshold.valueChanged.connect(self.update_threshold_info)
         self.settings_panel.btn_start.clicked.connect(self.start_duplicate_check)
-
-        # --- REMOVED: Signals for the old ReviewPanel ---
-        self.status_panel.btn_move_duplicates.clicked.connect(self.move_approved_duplicates)
+        # --- CHANGED: Connect to the new process button ---
+        self.status_panel.btn_process_duplicates.clicked.connect(self.start_file_actions)
 
     def set_button_state(self, button, state):
         button.setStyleSheet(self.STYLES[state])
@@ -100,7 +106,16 @@ class DuplicateWindow(QWidget):
         is_auto = self.settings_panel.mode_combo.currentText() == "Automatic selection"
         self.settings_panel.strategy_label.setVisible(is_auto)
         self.settings_panel.strategy_combo.setVisible(is_auto)
-        # --- CHANGED: The old review panel is gone, so we don't need to hide it ---
+        self.on_strategy_changed() # Update visibility of sub-options
+
+    # --- NEW: Method to handle strategy changes and show/hide relevant UI ---
+    def on_strategy_changed(self):
+        is_auto = self.settings_panel.mode_combo.currentText() == "Automatic selection"
+        selected_strategy = self.settings_panel.strategy_combo.currentData(Qt.UserRole)
+        is_unique_versions = selected_strategy == SelectionStrategy.KEEP_ALL_UNIQUE_VERSIONS
+        
+        show_options = is_auto and is_unique_versions
+        self.settings_panel.unique_version_options_frame.setVisible(show_options)
 
     def append_log_message(self, message):
         self.status_panel.log_window.append(message)
@@ -116,7 +131,7 @@ class DuplicateWindow(QWidget):
         self.settings_panel.help_threshold.setText(text)
 
     def select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder", "C:\\")
         if folder:
             self.folder_path = folder
             self.settings_panel.label_folder.setText(f"<b>Selected:</b> {os.path.basename(folder)}")
@@ -133,13 +148,13 @@ class DuplicateWindow(QWidget):
 
         self.set_button_state(self.settings_panel.btn_start, 'disabled')
         self.set_button_state(self.settings_panel.btn_folder, 'disabled')
-        self.set_button_state(self.status_panel.btn_move_duplicates, 'disabled')
+        self.set_button_state(self.status_panel.btn_process_duplicates, 'disabled')
 
-        self.settings_panel.slider_threshold.setEnabled(False)
-        self.settings_panel.mode_combo.setEnabled(False)
-        self.settings_panel.strategy_combo.setEnabled(False)
+        self.settings_panel.setDisabled(True)
 
         self.all_groups.clear()
+        self.files_for_removal.clear()
+        self.files_to_sort.clear()
         self.current_group_index = -1
         self.status_panel.progress_bar.setValue(0)
         self.status_panel.log_window.clear()
@@ -170,12 +185,11 @@ class DuplicateWindow(QWidget):
 
         if mode == "Manual review":
             self.duplicate_checker.manual_check_finished.connect(self.handle_manual_check_finished)
-            self.duplicate_checker.manual_check_finished.connect(self.check_thread.quit)
         else:
             self.duplicate_checker.automatic_selection_finished.connect(self.handle_automatic_selection_finished)
-            self.duplicate_checker.automatic_selection_finished.connect(self.check_thread.quit)
-
+        
         self.check_thread.started.connect(self.duplicate_checker.run)
+        self.check_thread.finished.connect(self.check_thread.quit)
         self.check_thread.finished.connect(self.check_thread.deleteLater)
         self.check_thread.finished.connect(lambda: setattr(self, 'check_thread', None))
         self.check_thread.start()
@@ -222,32 +236,37 @@ class DuplicateWindow(QWidget):
         self.status_panel.progress_bar.setValue(100)
         
         if self.all_groups:
-            # --- NEW: Start the new dialog-based review process ---
             self.start_manual_review_session()
         else:
             QMessageBox.information(self, "No Duplicates Found", "The scan completed, but no duplicate groups were found.")
             self.log_performance_if_finished()
 
-    def handle_automatic_selection_finished(self, files_for_removal, check_stats):
+    def handle_automatic_selection_finished(self, files_for_removal, files_to_sort, check_stats):
         self.reactivate_ui_after_check()
         self.active_run_stats.update(check_stats)
         self.active_run_stats["groups_found"] = check_stats.get("groups_found", 0)
+        
+        self.files_for_removal = files_for_removal
+        self.files_to_sort = files_to_sort
+        
         validated_count = check_stats.get("files_processed", 0)
         log_text = f"{validated_count} image files were validated and sent for processing."
         self.append_log_message(log_text)
         logging.info(log_text)
-        for file_path in files_for_removal:
-            self.match_engine.add_file_for_removal(file_path)
-        num_files = len(files_for_removal)
-        status_text = f"[OK] Automatic selection finished. {num_files} files marked for removal."
+        
+        num_to_remove = len(self.files_for_removal)
+        num_to_sort = len(self.files_to_sort.get('Originals', [])) + len(self.files_to_sort.get('Last Edited', []))
+
+        status_text = f"[OK] Auto selection finished. {num_to_remove} files marked for removal, {num_to_sort} for sorting."
         logging.info(status_text)
         self.status_panel.status.setText(status_text)
         self.status_panel.progress_bar.setValue(100)
-        if num_files > 0:
-            self.set_button_state(self.status_panel.btn_move_duplicates, 'highlight')
-            QMessageBox.information(self, "Automatic Selection Complete", f"{num_files} files are ready to be moved to the duplicates folder.")
+        
+        if num_to_remove > 0 or num_to_sort > 0:
+            self.set_button_state(self.status_panel.btn_process_duplicates, 'highlight')
+            QMessageBox.information(self, "Automatic Selection Complete", f"{num_to_remove} files are ready for removal and {num_to_sort} for sorting.")
         else:
-            QMessageBox.information(self, "No Duplicates", "Found no files to remove based on the selected strategy.")
+            QMessageBox.information(self, "No Actions Needed", "Found no files to remove or sort based on the selected strategy.")
             self.log_performance_if_finished()
 
     def reactivate_ui_after_check(self):
@@ -256,10 +275,7 @@ class DuplicateWindow(QWidget):
             self.set_button_state(self.settings_panel.btn_start, 'highlight')
         else:
             self.set_button_state(self.settings_panel.btn_start, 'disabled')
-
-        self.settings_panel.slider_threshold.setEnabled(True)
-        self.settings_panel.mode_combo.setEnabled(True)
-        self.settings_panel.strategy_combo.setEnabled(True)
+        self.settings_panel.setEnabled(True)
 
     def handle_check_error(self, error_message):
         QMessageBox.critical(self, "Error During Check", error_message)
@@ -267,90 +283,105 @@ class DuplicateWindow(QWidget):
         self.status_panel.progress_bar.setValue(0)
         self.reactivate_ui_after_check()
 
-    # --- NEW: Method to manage the new review dialog session ---
     def start_manual_review_session(self):
         self.current_group_index = 0
+        self.match_engine.clear_list() # Clear previous manual selections
         self.process_next_group()
 
-    # --- NEW: Method to show the dialog for the current group ---
     def process_next_group(self):
         if not (0 <= self.current_group_index < len(self.all_groups)):
-            # This is called when all groups have been reviewed
-            self.status_panel.status.setText(f"[DONE] Finished reviewing all {len(self.all_groups)} groups.")
-            if self.match_engine.get_files_for_removal():
-                self.set_button_state(self.status_panel.btn_move_duplicates, 'highlight')
+            self.files_for_removal = self.match_engine.get_files_for_removal()
+            num_to_remove = len(self.files_for_removal)
+            self.status_panel.status.setText(f"[DONE] Finished reviewing all {len(self.all_groups)} groups. {num_to_remove} files marked for removal.")
+            if num_to_remove > 0:
+                self.set_button_state(self.status_panel.btn_process_duplicates, 'highlight')
             else:
-                QMessageBox.information(self, "Review Complete", "You have finished reviewing all groups, but did not select any files for removal.")
+                QMessageBox.information(self, "Review Complete", "You finished reviewing all groups, but did not select any files for removal.")
                 self.log_performance_if_finished()
             return
 
         active_group_paths = self.all_groups[self.current_group_index]
         
-        # Create and configure the dialog for the current group
         dialog = ReviewDialog(self.all_file_data, self.STYLES, self)
         dialog.group_approved.connect(self.handle_group_approved)
         dialog.group_skipped.connect(self.handle_group_skipped)
-        
-        # This call shows the dialog and blocks until the user makes a choice
         dialog.review_group(active_group_paths, self.current_group_index, len(self.all_groups))
 
-    # --- NEW: Handler for when the user approves a group in the dialog ---
     def handle_group_approved(self, path_to_keep):
         active_group = self.all_groups[self.current_group_index]
         for file_path in active_group:
             if file_path != path_to_keep:
                 self.match_engine.add_file_for_removal(file_path)
         logging.info(f"GROUP {self.current_group_index + 1}: Keeping '{os.path.basename(path_to_keep)}'")
-        
         self.current_group_index += 1
         self.process_next_group()
 
-    # --- NEW: Handler for when the user skips a group in the dialog ---
     def handle_group_skipped(self):
         logging.info(f"GROUP {self.current_group_index + 1}: Skipped.")
         self.current_group_index += 1
         self.process_next_group()
     
-    # --- REMOVED: All old methods related to the built-in review panel ---
-    # on_thumbnail_clicked, display_current_group, next_group, approve_group
-
-    def move_approved_duplicates(self):
-        files_for_removal = self.match_engine.get_files_for_removal()
-        if not files_for_removal:
-            QMessageBox.information(self, "No Files", "There are no approved duplicates to move.")
+    # --- NEW: Renamed and updated to start the ActionWorker ---
+    def start_file_actions(self):
+        if not self.files_for_removal and not self.files_to_sort.get('Originals') and not self.files_to_sort.get('Last Edited'):
+            QMessageBox.information(self, "No Files", "There are no files selected for any action.")
             return
-        self.active_run_stats['files_marked_for_removal'] = len(files_for_removal)
-        self.active_run_stats['discarded_files'] = files_for_removal
+            
+        self.active_run_stats['files_marked_for_removal'] = len(self.files_for_removal)
+        self.active_run_stats['discarded_files'] = self.files_for_removal
+        
+        # --- NEW: Build the action configuration dictionary ---
+        remains_action_text = self.settings_panel.remains_action_combo.currentText()
+        action_config = {
+            'files_for_removal': self.files_for_removal,
+            'files_to_sort': self.files_to_sort,
+            'remains_action': 'recycle' if 'Recycle' in remains_action_text else 'move',
+            'duplicates_folder': os.path.join(TARGET_BASE_DIR, DUPLICATES_FOLDER_NAME),
+            'source_folder': self.folder_path,
+            'enable_sorting': self.settings_panel.sort_files_checkbox.isChecked()
+        }
 
-        duplicate_folder = os.path.join(TARGET_BASE_DIR, DUPLICATES_FOLDER_NAME)
+        self.set_button_state(self.status_panel.btn_process_duplicates, 'disabled')
+        logging.info(f"Starting file actions with config: {action_config}")
+        
+        self.action_thread = QThread()
+        self.action_worker = ActionWorker(action_config)
+        self.action_worker.moveToThread(self.action_thread)
+        self.action_worker.progress_log.connect(self.append_log_message)
+        self.action_worker.finished.connect(self.handle_actions_finished)
+        
+        self.action_thread.started.connect(self.action_worker.run)
+        self.action_thread.finished.connect(self.action_thread.quit)
+        self.action_thread.finished.connect(self.action_thread.deleteLater)
+        self.action_thread.finished.connect(lambda: setattr(self, 'action_thread', None))
+        self.action_thread.start()
 
-        self.set_button_state(self.status_panel.btn_move_duplicates, 'disabled')
-        logging.info(f"Starting move of {len(files_for_removal)} files to '{duplicate_folder}'...")
-        self.move_thread = QThread()
-        self.file_mover = FileMover(files_for_removal, duplicate_folder)
-        self.file_mover.moveToThread(self.move_thread)
-        self.file_mover.progress_log.connect(self.append_log_message)
-        self.file_mover.finished.connect(self.handle_move_finished)
-        self.move_thread.started.connect(self.file_mover.run)
-        self.move_thread.finished.connect(self.move_thread.quit)
-        self.move_thread.finished.connect(self.move_thread.deleteLater)
-        self.move_thread.finished.connect(lambda: setattr(self, 'move_thread', None))
-        self.move_thread.start()
-
-    def handle_move_finished(self, moved_counter, failed_counter):
-        logging.info(f"File move complete. {moved_counter} files moved, {failed_counter} failed.")
-        QMessageBox.information(self, "Done", f"Moved {moved_counter} files. {failed_counter} failed.")
-        self.active_run_stats['files_moved'] = moved_counter
+    # --- NEW: Renamed and updated to handle results from ActionWorker ---
+    def handle_actions_finished(self, action_stats):
+        moved = action_stats.get('moved', 0)
+        recycled = action_stats.get('recycled', 0)
+        sorted_count = action_stats.get('sorted', 0)
+        failed = action_stats.get('failed', 0)
+        
+        logging.info(f"File actions complete. Moved: {moved}, Recycled: {recycled}, Sorted: {sorted_count}, Failed: {failed}.")
+        QMessageBox.information(self, "Done", f"Actions complete.\n- Moved to Duplicates: {moved}\n- Recycled: {recycled}\n- Sorted: {sorted_count}\n- Failed: {failed}")
+        
+        self.active_run_stats['files_moved'] = moved
+        self.active_run_stats['files_recycled'] = recycled
+        self.active_run_stats['files_sorted'] = sorted_count
+        self.active_run_stats['move_time'] = action_stats.get('move_time', 0)
+        
         self.log_performance_if_finished()
         self.match_engine.clear_list()
+        self.files_for_removal.clear()
+        self.files_to_sort.clear()
+
 
     def log_performance_if_finished(self):
         if self.start_time > 0:
             total_time = time.monotonic() - self.start_time
             self.active_run_stats['total_time'] = total_time
-            discarded_files = self.match_engine.get_files_for_removal()
-            self.active_run_stats['discarded_files'] = discarded_files
-            self.active_run_stats.setdefault('files_marked_for_removal', len(discarded_files))
+            self.active_run_stats.setdefault('files_marked_for_removal', 0)
             self.active_run_stats.setdefault('files_moved', 0)
             logging.info(f"--- Run completed in {total_time:.2f} seconds ---")
             self.performance_logger.log_run(self.active_run_stats)
@@ -361,9 +392,9 @@ class DuplicateWindow(QWidget):
         if self.check_thread and self.check_thread.isRunning():
             self.check_thread.quit()
             self.check_thread.wait()
-        if self.move_thread and self.move_thread.isRunning():
-            self.move_thread.quit()
-            self.move_thread.wait()
+        if self.action_thread and self.action_thread.isRunning():
+            self.action_thread.quit()
+            self.action_thread.wait()
         event.accept()
 
     def handle_progress_updated(self, value, text):
