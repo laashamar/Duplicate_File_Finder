@@ -6,6 +6,8 @@ import logging
 import ctypes
 import time
 from collections import Counter
+# --- NEW: Added ThreadPoolExecutor for parallel downloads ---
+from concurrent.futures import ThreadPoolExecutor
 from config import ALLOWED_IMAGE_EXTENSIONS
 
 # Windows file attribute constant for files that are not fully present locally
@@ -54,26 +56,42 @@ def scan_directory(folder_path):
         "scan_duration": scan_duration
     }
 
+def _trigger_download(path):
+    """Reads the first byte of a file to trigger its download from the cloud."""
+    try:
+        with open(path, 'rb') as f:
+            f.read(1)
+        logging.info(f"Download complete for: {os.path.basename(path)}")
+        return True
+    except Exception as e:
+        logging.error(f"Could not download the file {os.path.basename(path)}: {e}")
+        return False
+
 def ensure_files_are_local(file_paths, progress_callback):
     """
-    Checks a list of files and triggers downloads for any that are online-only.
+    Checks a list of files and triggers downloads in parallel for any that are online-only.
     """
     start_time = time.monotonic()
     online_files = [path for path in file_paths if is_online_only(path)]
+    
     if not online_files:
         logging.info("All files are already available locally.")
         return 0.0
+        
     total_to_download = len(online_files)
     logging.info(f"Found {total_to_download} files that need to be downloaded from the cloud.")
-    for i, path in enumerate(online_files):
-        progress_callback(i + 1, total_to_download)
-        try:
-            # Reading the first byte of the file triggers the download
-            with open(path, 'rb') as f:
-                f.read(1)
-            logging.info(f"Download complete for: {os.path.basename(path)}")
-        except Exception as e:
-            logging.error(f"Could not download the file {os.path.basename(path)}: {e}")
+    
+    # --- NEW: Using ThreadPoolExecutor for parallel downloads ---
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Submit all download tasks
+        futures = {executor.submit(_trigger_download, path): path for path in online_files}
+        
+        for future in futures:
+            future.result()  # Wait for the download to complete
+            completed_count += 1
+            progress_callback(completed_count, total_to_download)
+            
     download_duration = time.monotonic() - start_time
     logging.info(f"Download of {total_to_download} files completed in {download_duration:.2f} seconds.")
     return download_duration
