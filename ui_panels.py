@@ -4,7 +4,8 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
-    QComboBox, QScrollArea, QWidget, QProgressBar, QTextEdit, QGridLayout
+    QComboBox, QScrollArea, QWidget, QProgressBar, QTextEdit, QGridLayout,
+    QCheckBox
 )
 from automatic_selector import SelectionStrategy
 
@@ -41,6 +42,29 @@ class SettingsPanel(QFrame):
         mode_layout.addStretch()
         layout.addLayout(mode_layout)
 
+        # --- NEW: Added options for the KEEP_ALL_UNIQUE_VERSIONS strategy ---
+        self.unique_version_options_frame = QFrame()
+        self.unique_version_options_frame.setFrameShape(QFrame.NoFrame)
+        unique_options_layout = QVBoxLayout(self.unique_version_options_frame)
+        unique_options_layout.setContentsMargins(10, 5, 10, 5)
+        
+        self.sort_files_checkbox = QCheckBox("Sort retained files into 'Originals' and 'Last Edited' subfolders")
+        unique_options_layout.addWidget(self.sort_files_checkbox)
+
+        self.remains_action_frame = QFrame()
+        self.remains_action_frame.setFrameShape(QFrame.NoFrame)
+        remains_layout = QHBoxLayout(self.remains_action_frame)
+        remains_layout.setContentsMargins(0, 0, 0, 0)
+        remains_layout.addWidget(QLabel("Action for other non-selected files:"))
+        self.remains_action_combo = QComboBox()
+        self.remains_action_combo.addItems(["Move to Recycle Bin", "Move to 'Duplicates' Folder"])
+        remains_layout.addWidget(self.remains_action_combo)
+        remains_layout.addStretch()
+        unique_options_layout.addWidget(self.remains_action_frame)
+        
+        layout.addWidget(self.unique_version_options_frame)
+        # --- End of new options ---
+
         # Sensitivity (Threshold)
         threshold_layout = QHBoxLayout()
         self.label_threshold = QLabel()
@@ -59,49 +83,14 @@ class SettingsPanel(QFrame):
         self.btn_start = QPushButton("🚀 Start Duplicate Check")
         layout.addWidget(self.btn_start)
 
-class ReviewPanel(QFrame):
-    """The panel for manual review of duplicate groups."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFrameShape(QFrame.StyledPanel)
-        layout = QVBoxLayout(self)
-        title = QLabel("<b>2. Manual Review</b>")
-        layout.addWidget(title)
-
-        self.group_status_label = QLabel("No groups to display")
-        layout.addWidget(self.group_status_label)
-
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
-        self.group_display_widget = QWidget()
-        self.group_display_layout = QGridLayout(self.group_display_widget)
-        self.group_display_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-
-        scroll_area.setWidget(self.group_display_widget)
-        layout.addWidget(scroll_area, 1)
-
-        self.btn_approve_group = QPushButton("✅ Approve Group")
-        self.btn_skip_group = QPushButton("❌ Skip Group")
-        self.btn_approve_group.setEnabled(False)
-        self.btn_skip_group.setEnabled(False)
-
-        choice_layout = QHBoxLayout()
-        choice_layout.addStretch()
-        choice_layout.addWidget(self.btn_approve_group)
-        choice_layout.addWidget(self.btn_skip_group)
-        choice_layout.addStretch()
-        layout.addLayout(choice_layout)
 
 class StatusPanel(QFrame):
-    """The panel for status, log, and the final move button."""
+    """The panel for status, log, and the final action button."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(self)
-        title = QLabel("<b>3. Status and Log</b>")
+        title = QLabel("<b>2. Status and Actions</b>")
         layout.addWidget(title)
 
         status_layout = QHBoxLayout()
@@ -129,6 +118,7 @@ class StatusPanel(QFrame):
         self.log_window.setFixedHeight(100)
         layout.addWidget(self.log_window)
 
-        self.btn_move_duplicates = QPushButton("🗑️ Move Selected Duplicates")
-        self.btn_move_duplicates.setEnabled(False)
-        layout.addWidget(self.btn_move_duplicates)
+        # --- CHANGED: Renamed button to be more generic ---
+        self.btn_process_duplicates = QPushButton("⚙️ Process Duplicates")
+        self.btn_process_duplicates.setEnabled(False)
+        layout.addWidget(self.btn_process_duplicates)
