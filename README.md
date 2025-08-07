@@ -50,7 +50,7 @@ Here’s a preview of the GUI:
 
 ```bash
 pip install -r requirements.txt
-python visual_duplicate_checker.py
+python duplicate_file_finder.py
 ```
 
 ---
