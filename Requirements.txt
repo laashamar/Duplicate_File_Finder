@@ -1,0 +1,7 @@
+Requires Python 3.10+
+PySide6
+Pillow
+imagehash
+pybktree
+pyvips
+send2trash
